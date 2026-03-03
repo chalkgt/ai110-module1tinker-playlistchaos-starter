@@ -58,7 +58,19 @@ def normalize_song(raw: Song) -> Song:
 
 
 def classify_song(song: Song, profile: Dict[str, object]) -> str:
-    """Return a mood label given a song and user profile."""
+    """Return a mood label given a song and user profile.
+
+    The original implementation looked for chill keywords in the *title* rather
+    than the genre, which meant tracks with a chill genre would not be picked up
+    unless the genre also matched one of the keywords.  This was surprising when
+    songs like "Lo-fi Rain" (genre "lofi") were not classified as Chill because
+    the word "lofi" wasn't in the title.  Examples in the UI could end up in
+    Mixed even though the genre clearly belonged in Chill, which felt off to
+    users.
+
+    The fix simply checks the genre for both hype and chill keywords so that the
+    logic is consistent.
+    """
     energy = song.get("energy", 0)
     genre = song.get("genre", "")
     title = song.get("title", "")
@@ -71,7 +83,8 @@ def classify_song(song: Song, profile: Dict[str, object]) -> str:
     chill_keywords = ["lofi", "ambient", "sleep"]
 
     is_hype_keyword = any(k in genre for k in hype_keywords)
-    is_chill_keyword = any(k in title for k in chill_keywords)
+    # corrected field for chill keywords
+    is_chill_keyword = any(k in genre for k in chill_keywords)
 
     if genre == favorite_genre or energy >= hype_min_energy or is_hype_keyword:
         return "Hype"
@@ -107,7 +120,21 @@ def merge_playlists(a: PlaylistMap, b: PlaylistMap) -> PlaylistMap:
 
 
 def compute_playlist_stats(playlists: PlaylistMap) -> Dict[str, object]:
-    """Compute statistics across all playlists."""
+    """Compute statistics across all playlists.
+
+    The previous implementation had two incorrect calculations:
+
+    * `hype_ratio` was computed as `len(hype) / len(hype)` (always 1.0 when any
+      hype songs existed) because the `total` variable was accidentally set to
+      the length of the hype list instead of the total number of songs.
+    * `avg_energy` summed only the energies of hype songs but then divided by the
+      number of *all* songs, producing a value that was much lower than any
+      individual track energy when there were non-hype songs.
+
+    Both of these led to confusing metrics in the UI; the ratio should reflect
+    how many of the tracks are hype versus the full collection, and the average
+    energy should be the mean energy across all songs, not just one bucket.
+    """
     all_songs: List[Song] = []
     for songs in playlists.values():
         all_songs.extend(songs)
@@ -116,18 +143,18 @@ def compute_playlist_stats(playlists: PlaylistMap) -> Dict[str, object]:
     chill = playlists.get("Chill", [])
     mixed = playlists.get("Mixed", [])
 
-    total = len(hype)
-    hype_ratio = len(hype) / total if total > 0 else 0.0
+    total_songs = len(all_songs)
+    hype_ratio = len(hype) / total_songs if total_songs > 0 else 0.0
 
     avg_energy = 0.0
     if all_songs:
-        total_energy = sum(song.get("energy", 0) for song in hype)
-        avg_energy = total_energy / len(all_songs)
+        total_energy = sum(song.get("energy", 0) for song in all_songs)
+        avg_energy = total_energy / total_songs
 
     top_artist, top_count = most_common_artist(all_songs)
 
     return {
-        "total_songs": len(all_songs),
+        "total_songs": total_songs,
         "hype_count": len(hype),
         "chill_count": len(chill),
         "mixed_count": len(mixed),
@@ -159,7 +186,15 @@ def search_songs(
     query: str,
     field: str = "artist",
 ) -> List[Song]:
-    """Return songs matching the query on a given field."""
+    """Return songs matching the query on a given field.
+
+    The earlier version was doing `value in q` which meant the entire field
+    content had to be a substring of the *query*, effectively preventing
+    partial matches unless the user typed the full artist/genre/etc.  In the
+    UI that caused searches like "oce" to return nothing even though "ocean"
+    was present.  The check has been flipped and a couple of small tweaks were
+    added for clarity.
+    """
     if not query:
         return songs
 
@@ -168,7 +203,8 @@ def search_songs(
 
     for song in songs:
         value = str(song.get(field, "")).lower()
-        if value and value in q:
+        # match if the query is contained within the song's field value
+        if value and q in value:
             filtered.append(song)
 
     return filtered
@@ -178,7 +214,14 @@ def lucky_pick(
     playlists: PlaylistMap,
     mode: str = "any",
 ) -> Optional[Song]:
-    """Pick a song from the playlists according to mode."""
+    """Pick a song from the playlists according to mode.
+
+    The helper `random_choice_or_none` now safe-guards against empty lists, so
+    callers can rely on a `None` result rather than letting an IndexError bubble
+    up.  This mirrors the UI check where a warning message is shown if no
+    song is available.  Without the guard a user could crash the app by hitting
+    "Feeling lucky" when there were no songs in the requested category.
+    """
     if mode == "hype":
         songs = playlists.get("Hype", [])
     elif mode == "chill":
@@ -190,9 +233,18 @@ def lucky_pick(
 
 
 def random_choice_or_none(songs: List[Song]) -> Optional[Song]:
-    """Return a random song or None."""
+    """Return a random song or None.
+
+    `random.choice` raises an IndexError when passed an empty sequence, which
+    isn't appropriate for the UI code that expects a `None` return value and
+    handles it by showing a warning.  Guarding here keeps callers simpler and
+    prevents crashes during edge cases (e.g. empty library or mode with no
+    songs).
+    """
     import random
 
+    if not songs:
+        return None
     return random.choice(songs)
 
 
